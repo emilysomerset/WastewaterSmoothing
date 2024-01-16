@@ -13,14 +13,25 @@ knitr::opts_chunk$set(
 )
 ```
 
-# OSplines
+# WastewaterSmoothing
 
 <!-- badges: start -->
 <!-- badges: end -->
 
-The goal of the `OSplines` package is to efficiently implement model-based smoothing with the integrated Wiener's process, within a variety of Bayesian hierarchical models.
+The goal of the `WastewaterSmoothing` package is
 
 ## Installation
 
+You can install the development version of
+
 ## Example
+
+We consider the following data set of respiratory syncytial viral (RSV) in California, which is available from the WastewaterSCAN Dashboard
+
+```{r}
+#library(WastewaterSmoothing)
+load('./data/california_rsv.rda')
+
+head(work_d)
+```
 
