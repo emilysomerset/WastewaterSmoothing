@@ -11,6 +11,14 @@ knitr::opts_chunk$set(
   fig.path = "man/figures/README-",
   out.width = "100%"
 )
+
+
+library(OSplines)
+library(TMB)
+library(aghq)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
 ```
 
 # WastewaterSmoothing
@@ -26,6 +34,17 @@ You can install the development version of
 
 ## Example
 
+First we compile the cpp:
+
+```{r,echo = FALSE}
+
+compile(file="./src/00_Gamma_daily_AR2_deriv.cpp")
+
+try(dyn.unload(dynlib("/Users/emilysomerset/Library/CloudStorage/OneDrive-UniversityofToronto/Research/WasteWaterPackage/src/00_Gamma_daily_AR2_deriv")),silent = TRUE)
+dyn.load(dynlib("/Users/emilysomerset/Library/CloudStorage/OneDrive-UniversityofToronto/Research/WasteWaterPackage/src/00_Gamma_daily_AR2_deriv"))
+
+```
+
 We consider the following data set of respiratory syncytial viral (RSV) in California, which is available from the WastewaterSCAN Dashboard
 
 ```{r}
@@ -35,3 +54,356 @@ load('./data/california_rsv.rda')
 head(work_d)
 ```
 
+```{r}
+#####################
+# Data dictionary
+####################
+
+#sewershed_pop: Human population contribution to the sewershed of the collection site
+#RSV_gc_g_dry_weight: Copies of RSV RNA per gram of dried solid
+#RSV_gc_g_dry_weight_pmmov: Normalized
+#RSV_gc_g_dry_weight_trimmed5_pmmov: Probably a cleaner version of the data.
+
+gg <- work_d %>%
+  ggplot(aes(sample_date,RSV_gc_g_dry_weight_trimmed5_pmmov*1000000,group = site_id))+
+  geom_point(size=0.3)+
+  geom_line()+
+  theme_bw()+
+  scale_y_continuous(name = "Quantity of nucleic-acids,\nPMMoV Normalized (x1 million)", breaks = scales::pretty_breaks(n=5))+
+  scale_x_date(breaks=scales::pretty_breaks(n=10), name = "Sample date") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+ 
+  theme(legend.position="bottom")
+gg
+```
+
+```{r}
+plot(0:5,(1+sqrt(12)*(0:5)*1)*exp(-sqrt(12)*(0:5)*1),type="l")
+```
+
+
+
+The model can 
+
+```{r , echo = FALSE,  warning=FALSE, message=FALSE}
+set.seed(2)
+df = work_d %>%
+  mutate(y_norm = RSV_gc_g_dry_weight_trimmed5_pmmov*1000000,  # times 1 million
+         norm = 1,                                             # PMMoV data not available
+         y = y_norm*norm) %>% 
+  filter(site_id %in% sample(unique(work_d$site_id),6)) %>% 
+  mutate(station = factor(site_id)) %>% 
+  mutate(y = ifelse(y == 0,NA_real_, y)) %>%   #remove 0s because gamma distributed outcome (maybe should treat as censored)
+  filter(!is.na(y))
+
+rr <- df$sample_date %>% range()
+
+# create a grid for each site with the same date range. 
+df <- expand.grid(sample_date = seq(rr[1],rr[2],1),
+                      site_id = unique(df$site_id)) %>% 
+  left_join(df, by = c("sample_date","site_id"))
+
+# If data is censored, indicated it by TRUE
+df <- df %>% 
+  mutate(censored_y = FALSE) 
+
+
+df=df %>%  
+  arrange(station,sample_date) %>% 
+  ungroup()
+
+df_full <- df %>% 
+  mutate(obs = !is.na(y)) %>%   # indicator for whether the observation is not missing (observed)
+  mutate(nindex = 1:nrow(.))    # row_id
+
+df <- df %>% 
+  filter(!is.na(y)) %>%         # filters out missing data
+  mutate(nindex2 = 1:nrow(.))   # row_id
+
+df$t <- df$sample_date %>% as.numeric()
+df$t <- df$t - min(df$t)
+df_full$t <- df_full$sample_date %>% as.numeric()
+df_full$t <- df_full$t - min(df_full$t)
+
+
+# Need to know where station data start and end for the AR2 process
+stationsizes = df_full %>%  
+  group_by(station) %>%  
+  summarise(ll = length(station)) %$% ll  
+
+n1 = df_full %>%  
+   mutate(n1 = 0:(nrow(.)-1)) %>%  
+   group_by(station) %>%  
+   slice(1) %$% n1 
+
+n1 <- c(n1, (nrow(df_full)))
+
+
+```
+
+
+```{r , echo = FALSE, warning = FALSE, message=FALSE}
+# Setup the design and precision matrix 
+polyOrder = 3
+knots <- seq(0,max(df$t), length.out = 100)
+
+B <- local_poly(knots = knots, 
+                 refined_x = df$t,
+                 p = polyOrder)
+
+P <- compute_weights_precision(x = knots)
+
+X = global_poly(x=df$t, p= polyOrder)
+Xfstat <- model.matrix(~station, data = df, contrasts.arg = list(station = "contr.sum"))[,-1]
+Xfstat <- as.matrix(Xfstat)
+X = cbind(X, Xfstat)
+
+daily <- model.matrix(~factor(t), data = df, contrasts.arg = list(sample_date = "contr.sum"))[,-1]
+obs <- model.matrix(~nindex -1, data = df_full %>% mutate(nindex=factor(nindex)) %>% filter(obs))
+y_ind_obs <- df %>% filter(censored_y==FALSE)%$%nindex2 -1
+y_ind_cens <- df %>% filter(censored_y==TRUE)%$%nindex2 - 1
+observed_y <- model.matrix(~nindex2 -1, data = df %>% mutate(nindex2=factor(nindex2)) %>% filter(censored_y==FALSE))
+censored_y <- model.matrix(~nindex2 -1, data = df %>% mutate(nindex2=factor(nindex2)) %>% filter(censored_y==TRUE))
+
+prior_IWP <- prior_conversion(d=7/31, prior =list(u=log(2),alpha = 0.5),p=polyOrder)
+
+tmbdat <- list(
+  # Design matrix
+  X = as(X, 'dgTMatrix'),
+  B = as(B, 'dgTMatrix'),
+  P = as(P,'dgTMatrix'),
+  daily = as(daily, 'dgTMatrix'),
+  obs = as(obs, 'dgTMatrix'),
+  # observed_y = as(observed_y, 'dgTMatrix'),
+  # censored_y = as(censored_y, 'dgTMatrix'),
+  logPdet = as.numeric(determinant(P,logarithm = T)$modulus),
+  # Response
+  y = df$y,
+  # PC Prior params
+  u1 = prior_IWP$u,
+  alpha1 = 0.5,
+  u2 = 0.5,
+  alpha2 = 0.5,
+  u3 =0.25, 
+  alpha3=0.5,
+  u4 =1, 
+  alpha4=0.5,
+  betaprec = 0.01,
+  n1=n1,
+  stationsizes = stationsizes,
+  denom = df$norm,
+  y_ind_obs=y_ind_obs
+  # y_ind_cens = y_ind_cens,
+  # cens_dir = rep(1, length(y_ind_cens))
+)
+```
+
+```{r , echo = FALSE, warning = FALSE, cache=TRUE}
+
+set.seed(2)
+init_W <- rnorm(ncol(tmbdat$obs),0,0.1)
+tmbparams <- list(
+  W = c(rep(0, (ncol(X) + ncol(B) + ncol(daily))),init_W,0,diff(init_W)), # W = c(U,beta,Z); U = B-Spline coefficients
+  theta1 = 0, # -2log(sigma)
+  theta2 =0,
+  theta3 = 0,
+  theta4 = 0,
+  c_log = 0
+)
+
+
+ff <- TMB::MakeADFun(
+  data = tmbdat,
+  parameters = tmbparams,
+  random = "W",
+  DLL = "00_Gamma_daily_AR2_deriv",
+  silent = TRUE
+)
+
+# Hessian not implemented for RE models
+ff$he <- function(w) numDeriv::jacobian(ff$gr,w)
+
+aghq_k = 3
+mdl1 <- aghq::marginal_laplace_tmb(ff,k=aghq_k,startingvalue = c(0,0,0,0,0))  ## it takes a little while when there's 59 stations. And so much missing data. It's working though. 40179 days but 8816 observations.
+
+```
+
+```{r , echo = FALSE, warning = FALSE, message=FALSE}
+# load('../Model Results/june6_mdl1_Kingston.RData')
+samps1 <- sample_marginal(mdl1, M = 3000)
+pos_samps <- samps1$samps
+
+coefsamps1 <- samps1$samps[1:ncol(P),]
+global_samps1 <- samps1$samps[(ncol(P) + 1):(ncol(P) + ncol(X)-ncol(Xfstat)),]
+Xf_samps1 <- samps1$samps[(ncol(P) + ncol(X)-ncol(Xfstat) + 1):(ncol(P) + ncol(X)),]
+daily_samps1 <- samps1$samps[(ncol(P) + ncol(X) + 1):(ncol(P) + ncol(X) + ncol(daily)),]
+IS_samps1 <- samps1$samps[(ncol(P) + ncol(X) + ncol(daily)+1):(ncol(P) + ncol(X) + ncol(daily)+nrow(df_full)),]
+IS_deriv_samps1 <- samps1$samps[(ncol(P) + ncol(X) + ncol(daily)+nrow(df_full)+1):(nrow(samps1$samps)),]
+
+nrow(coefsamps1)+ nrow(global_samps1) + nrow(Xf_samps1) + nrow(daily_samps1) + nrow(IS_samps1) + nrow(IS_deriv_samps1)
+nrow(samps1$samps)
+
+
+### g(t)
+
+f1 <- compute_post_fun(samps = coefsamps1, global_samps = global_samps1, 
+                       knots = knots, 
+                       refined_x = df$t,
+                       p = polyOrder, degree = 0)
+
+g_result <- extract_mean_interval_given_samps(f1)
+
+df$smoothed <- g_result$mean
+df$smoothed_upper <- g_result$pupper
+df$smoothed_lower <- g_result$plower
+
+df$exp_smoothed <- as.numeric(apply(exp(f1[,-1]), MARGIN=1,mean))
+df$exp_smoothed_upper <- as.numeric(apply(exp(f1[,-1]), MARGIN=1,quantile, p = 0.975))
+df$exp_smoothed_lower <- as.numeric(apply(exp(f1[,-1]), MARGIN=1,quantile, p = 0.025))
+
+to_summarize <- f1[,-1] + Xfstat%*%Xf_samps1 + daily%*%daily_samps1 + obs %*%IS_samps1
+to_summarize_daily <- daily%*%daily_samps1 
+to_summarize_IS <- obs %*% IS_samps1
+to_summarize_IS_deriv <- obs %*% IS_deriv_samps1
+df$fit <- as.numeric(apply(to_summarize, MARGIN=1,mean))
+df$fit_upper <- as.numeric(apply(to_summarize, MARGIN=1,quantile, p = 0.975))
+df$fit_lower <- as.numeric(apply(to_summarize, MARGIN=1,quantile, p = 0.025))
+
+df$daily <- as.numeric(apply(to_summarize_daily, MARGIN=1,mean))
+df$IS <- as.numeric(apply(to_summarize_IS, MARGIN=1,mean))
+df$IS_deriv <- as.numeric(apply(to_summarize_IS_deriv, MARGIN=1,mean))
+
+### g'(t)
+
+f1deriv <- compute_post_fun(samps = coefsamps1, global_samps = global_samps1, 
+                       knots = knots, 
+                       refined_x = df$t,
+                       p = polyOrder, degree = 1)
+
+## concentration
+g1st_samps <- cbind(f1[,1], (exp(f1[,-1]) * f1deriv[,-1]))
+
+
+g1st_samps <- data.frame(x= g1st_samps[,1], 
+                                 mean = g1st_samps[,-1] %>% apply(MARGIN = 1, mean), 
+                                 upper = g1st_samps[,-1] %>% apply(MARGIN = 1, quantile, p = 0.975),
+                                 lower = g1st_samps[,-1] %>% apply(MARGIN = 1, quantile, p = 0.025))
+
+
+
+df$exp_derivsmoothed <- g1st_samps$mean
+df$exp_derivsmoothed_upper <- g1st_samps$upper
+df$exp_derivsmoothed_lower<- g1st_samps$lower
+
+# log concentration
+g1st_samps <- cbind(f1[,1], f1deriv[,-1])
+
+
+g1st_samps <- data.frame(x= g1st_samps[,1], 
+                                 mean = g1st_samps[,-1] %>% apply(MARGIN = 1, mean), 
+                                 upper = g1st_samps[,-1] %>% apply(MARGIN = 1, quantile, p = 0.975),
+                                 lower = g1st_samps[,-1] %>% apply(MARGIN = 1, quantile, p = 0.025))
+
+
+
+df$derivsmoothed <- g1st_samps$mean
+df$derivsmoothed_upper <- g1st_samps$upper
+df$derivsmoothed_lower<- g1st_samps$lower
+
+as.numeric(apply(exp(f1deriv[,-1]), MARGIN=1,mean))[1:10]
+as.numeric(apply(exp(f1[,-1]) * f1deriv[,-1], MARGIN=1,mean))[1:10]
+### get derivatives for alpha
+
+
+
+marginals <- mdl1$marginals
+```
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE, fig.height=5, fig.cap="Posteriors for the adjusted evolution of viral concentration in wastewater and its derivative"}
+
+
+
+gg1 <- df %>% 
+  group_by(sample_date) %>% 
+  # slice(1) %>%  
+  ungroup() %>% 
+  ggplot(aes(x = sample_date, y_norm)) +
+  geom_line(aes(group = site_id, col = site_id), show.legend = FALSE,alpha=0.5)+
+  geom_line(aes(y = exp_smoothed),color = "#619CFF",lwd=1) + 
+  geom_ribbon(aes(ymax = exp_smoothed_upper, ymin = exp_smoothed_lower), alpha = 0.2) +
+  theme_bw()+
+  # ggtitle("Kingston biomarker-normalized N1")+ 
+  scale_y_continuous(name = "Viral concentrations\nh(t)", breaks = scales::pretty_breaks(n=5))+ 
+  scale_x_date(breaks=scales::pretty_breaks(n=12), name = "Sample date")
+
+
+
+gg2 <- df %>% 
+  group_by(sample_date) %>%
+  slice(1) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = sample_date)) + 
+  geom_ribbon(aes(ymax = exp_derivsmoothed_upper, ymin = exp_derivsmoothed_lower), alpha = 0.2) +
+  geom_line(aes(y = exp_derivsmoothed),color = "#619CFF",lwd=1) + 
+  theme_bw()+
+  scale_y_continuous(name = "Change in concentration\nh'(t)", breaks = scales::pretty_breaks(n=5))+ 
+  scale_x_date(breaks=scales::pretty_breaks(n=12), name = "Sample date")+
+  geom_hline(yintercept=0, lty="dashed")
+
+fest3 = cowplot::plot_grid(gg1,gg2,ncol=1, align="v") 
+fest3
+
+```
+
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE, fig.height=5}
+
+f1 <- compute_post_fun(samps = coefsamps1, global_samps = global_samps1, 
+                       knots = knots, 
+                       refined_x = df_full$t,
+                       p = polyOrder, degree = 0)
+
+f1deriv <- compute_post_fun(samps = coefsamps1, global_samps = global_samps1, 
+                       knots = knots, 
+                       refined_x = df_full$t,
+                       p = polyOrder, degree = 1)
+
+to_summarise_IS_f1 <- f1[,-1]+ IS_samps1
+df_full$exp_IS_f1 <- as.numeric(apply(exp(to_summarise_IS_f1), MARGIN=1,mean))
+df_full$exp_IS_f1_lwr <- as.numeric(apply(exp(to_summarise_IS_f1), MARGIN=1,quantile, 0.025))
+df_full$exp_IS_f1_upr <- as.numeric(apply(exp(to_summarise_IS_f1), MARGIN=1,quantile, 0.975))
+
+to_summarise_exp_IS_f1_deriv <- exp(f1[,-1]+ IS_samps1) *(f1deriv[,-1]+ IS_deriv_samps1)
+df_full$exp_IS_f1_deriv <- as.numeric(apply(to_summarise_exp_IS_f1_deriv, MARGIN=1,mean))
+df_full$exp_IS_f1_deriv_lwr <- as.numeric(apply(to_summarise_exp_IS_f1_deriv, MARGIN=1,quantile, 0.025))
+df_full$exp_IS_f1_deriv_upr <- as.numeric(apply(to_summarise_exp_IS_f1_deriv, MARGIN=1,quantile, 0.975))
+
+
+
+
+gg1 <- df_full %>% 
+  # filter(!is.na(y)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = sample_date, exp_IS_f1)) +
+  geom_line()+
+  geom_ribbon(aes(ymin = exp_IS_f1_lwr, ymax = exp_IS_f1_upr), alpha = 0.2)+
+  facet_wrap(~site_id,nrow = 1)+
+  theme_bw()+
+  scale_y_continuous(name = "Viral concentrations\nh(t)", breaks = scales::pretty_breaks(n=5))+ 
+  scale_x_date(breaks=scales::pretty_breaks(n=5), name = "Sample date")
+
+gg2 <- df_full %>% 
+  ungroup() %>% 
+  ggplot(aes(x = sample_date, exp_IS_f1_deriv)) +
+  geom_line()+
+    geom_ribbon(aes(ymin = exp_IS_f1_deriv_lwr, ymax = exp_IS_f1_deriv_upr), alpha = 0.2)+
+  facet_wrap(~site_id,nrow = 1)+
+  theme_bw()+
+  scale_y_continuous(name = "Derivative", breaks = scales::pretty_breaks(n=5))+ 
+  scale_x_date(breaks=scales::pretty_breaks(n=5), name = "Sample date")
+
+
+
+fest3 = cowplot::plot_grid(gg1,gg2,ncol=1, align="v") 
+
+fest3
+```
